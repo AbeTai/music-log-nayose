@@ -9,8 +9,11 @@ import json
 import re
 import random
 from typing import List, Dict, Tuple
+from collections import defaultdict
 import pandas as pd
-from Levenshtein import distance as levenshtein_distance
+import numpy as np
+from rapidfuzz.distance import Levenshtein
+from scipy.sparse import dok_matrix
 from rank_bm25 import BM25Okapi
 from google import genai
 from google.genai import types
@@ -125,12 +128,47 @@ def preprocess_data(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
+# ==================== ブロッキング ====================
+
+def normalize_for_blocking(name: str) -> str:
+    """ブロッキング用に名前を正規化"""
+    # 全角→半角、小文字化、空白削除
+    import unicodedata
+    name = unicodedata.normalize('NFKC', name)
+    name = name.lower()
+    name = re.sub(r'\s+', '', name)
+    return name
+
+
+def create_blocks(unique_names: List[str]) -> Dict[str, List[Tuple[int, str]]]:
+    """アーティスト名をブロックに分割（効率化のため）"""
+    print("ブロッキング中...")
+    blocks = defaultdict(list)
+
+    for idx, name in enumerate(unique_names):
+        # 複数のブロッキングキーを生成
+        normalized = normalize_for_blocking(name)
+
+        # ブロッキングキー1: 最初の2文字
+        if len(normalized) >= 2:
+            key1 = normalized[:2]
+            blocks[key1].append((idx, name))
+
+        # ブロッキングキー2: 最初の1文字
+        if len(normalized) >= 1:
+            key2 = normalized[0]
+            blocks[key2].append((idx, name))
+
+        # ブロッキングキー3: 長さの範囲（±3文字以内で比較）
+        length = len(name)
+        length_key = f"len_{length // 3}"
+        blocks[length_key].append((idx, name))
+
+    print(f"ブロック数: {len(blocks)}個")
+    return blocks
+
+
 # ==================== 距離計算 ====================
-
-def calculate_levenshtein_distance(name1: str, name2: str) -> int:
-    """レーベンシュタイン距離を計算"""
-    return levenshtein_distance(name1, name2)
-
 
 def tokenize_artist_name(name: str) -> List[str]:
     """アーティスト名を文字単位でトークン化"""
@@ -138,16 +176,46 @@ def tokenize_artist_name(name: str) -> List[str]:
     return list(name)
 
 
-def calculate_bm25_score(name1: str, name2: str, corpus_tokenized: List[List[str]]) -> float:
-    """BM25スコアを計算"""
-    bm25 = BM25Okapi(corpus_tokenized)
-    tokenized_query = tokenize_artist_name(name1)
-    scores = bm25.get_scores(tokenized_query)
+def build_distance_matrix(blocks: Dict[str, List[Tuple[int, str]]], n: int) -> dok_matrix:
+    """レーベンシュタイン距離行列を構築"""
+    print(f"レーベンシュタイン距離行列を構築中... (サイズ: {n}x{n})")
+    mat = dok_matrix((n, n), dtype="int16")
 
-    # name2のインデックスを見つける
-    # （この実装では簡略化のため、コーパス内での位置を仮定）
-    # 実際の使用では、名前とインデックスのマッピングが必要
-    return max(scores) if len(scores) > 0 else 0.0
+    total_comparisons = 0
+    for block_key, block in blocks.items():
+        idxs, strs = zip(*block)
+        for i in range(len(strs)):
+            for j in range(i + 1, len(strs)):
+                d = Levenshtein.distance(strs[i], strs[j])
+                mat[idxs[i], idxs[j]] = d
+                mat[idxs[j], idxs[i]] = d
+                total_comparisons += 1
+
+    print(f"レーベンシュタイン距離計算完了: {total_comparisons}ペア")
+    return mat
+
+
+def build_bm25_matrix(unique_names: List[str], n: int) -> np.ndarray:
+    """BM25スコア行列を構築"""
+    print(f"BM25スコア行列を構築中... (サイズ: {n}x{n})")
+
+    # 全アーティスト名をトークン化
+    corpus_tokenized = [tokenize_artist_name(name) for name in unique_names]
+
+    # BM25モデル構築
+    bm25 = BM25Okapi(corpus_tokenized)
+
+    # スコア行列を初期化
+    bm25_matrix = np.zeros((n, n), dtype=np.float32)
+
+    # 各アーティスト名をクエリとして全体にスコアリング
+    for i, name in enumerate(unique_names):
+        tokenized_query = tokenize_artist_name(name)
+        scores = bm25.get_scores(tokenized_query)
+        bm25_matrix[i, :] = scores
+
+    print(f"BM25スコア計算完了")
+    return bm25_matrix
 
 
 # ==================== 候補ペア抽出 ====================
@@ -157,43 +225,44 @@ def extract_candidate_pairs(df: pd.DataFrame) -> List[Dict]:
     print("\n=== 候補ペア抽出中 ===")
 
     unique_names = df['artist_name_preprocessed'].unique().tolist()
-    print(f"ユニークなアーティスト名: {len(unique_names)}件")
+    n = len(unique_names)
+    print(f"ユニークなアーティスト名: {n}件")
 
-    # BM25用のコーパス準備
-    corpus_tokenized = [tokenize_artist_name(name) for name in unique_names]
+    # 1. ブロッキング
+    blocks = create_blocks(unique_names)
 
+    # 2. レーベンシュタイン距離行列の構築
+    lev_matrix = build_distance_matrix(blocks, n)
+
+    # 3. BM25スコア行列の構築
+    bm25_matrix = build_bm25_matrix(unique_names, n)
+
+    # 4. 候補ペアの抽出
+    print("\n候補ペアを抽出中...")
     candidate_pairs = []
     pair_set = set()  # 重複チェック用
 
-    # 全ペアの組み合わせをチェック
-    for i, name1 in enumerate(unique_names):
-        for j, name2 in enumerate(unique_names):
-            if i >= j:  # 自分自身と重複ペアをスキップ
-                continue
+    # 距離行列から閾値を満たすペアを抽出
+    for i in range(n):
+        for j in range(i + 1, n):
+            # レーベンシュタイン距離を取得（計算されていない場合は大きな値）
+            lev_dist = lev_matrix[i, j] if (i, j) in lev_matrix else 9999
 
-            # レーベンシュタイン距離
-            lev_dist = calculate_levenshtein_distance(name1, name2)
-
-            # BM25スコア（簡易版）
-            # より正確には、name2をクエリとしてname1のスコアも計算すべき
-            tokenized_name1 = tokenize_artist_name(name1)
-            tokenized_name2 = tokenize_artist_name(name2)
-
-            # 簡易的なBM25スコア計算（双方向）
-            bm25 = BM25Okapi([tokenized_name1, tokenized_name2])
-            bm25_score1 = bm25.get_scores(tokenized_name1)[1]  # name2に対するスコア
-            bm25_score2 = bm25.get_scores(tokenized_name2)[0]  # name1に対するスコア
-            bm25_score = max(bm25_score1, bm25_score2)
+            # BM25スコアを取得（双方向の最大値）
+            bm25_score = max(bm25_matrix[i, j], bm25_matrix[j, i])
 
             # 閾値チェック
             if lev_dist <= LEVENSHTEIN_THRESHOLD or bm25_score >= BM25_THRESHOLD:
+                name1 = unique_names[i]
+                name2 = unique_names[j]
+
                 pair_key = tuple(sorted([name1, name2]))
                 if pair_key not in pair_set:
                     pair_set.add(pair_key)
                     candidate_pairs.append({
                         "name1": name1,
                         "name2": name2,
-                        "levenshtein_distance": lev_dist,
+                        "levenshtein_distance": int(lev_dist),
                         "bm25_score": float(bm25_score)
                     })
 
